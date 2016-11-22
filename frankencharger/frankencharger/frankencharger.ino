@@ -16,6 +16,10 @@
 
 #include <TickerScheduler.h>
 
+#include <RemoteDebug.h>
+RemoteDebug Debug;
+
+
 WiFiClient espClient;
 PubSubClient client(espClient);
 TickerScheduler ts(5);
@@ -58,7 +62,7 @@ short _timezone     = +10;
 byte _sun_buffer    = 3;
 byte _hr_sleep      = 23;
 // Config
-uint32_t _analog_interval = 10*1000;
+uint32_t _analog_interval = 10000;
 float _max_voltage = 30;
 float _min_voltage = 22;
 
@@ -180,7 +184,7 @@ void mqtt_rx(char* topic, byte* payload, unsigned int length) {
   String tmp;
   tmp = String(topic);
   String pl =  munge_payload(payload, length);
-
+  Debug.println("Got message " + tmp + " = " + pl);
   // Listen for solar inverter output data
   if(tmp.startsWith("inverter")){
     tmp.replace("inverter/","");
@@ -207,45 +211,52 @@ void mqtt_rx(char* topic, byte* payload, unsigned int length) {
         charger(MODE_IDLE);
       }
     }
+    if(tmp == "solar_min") _solar_min = pl.toFloat();
+    if(tmp == "hr_sleep") _hr_sleep = pl.toInt();
+    if(tmp == "hr_sunrise") _sunrise = pl.toInt();
+    if(tmp == "hr_sunset") _sunset = pl.toInt();
+    if(tmp == "sun_buffer") _sun_buffer = pl.toInt();
+    if(tmp == "dst") _dst = pl.toInt();
+    if(tmp == "max_voltage") _max_voltage = pl.toFloat();
+    if(tmp == "min_voltage") _min_voltage = pl.toFloat();
   }
 }
 
+
+void reconnect_mqtt(){
+  if (!client.connected()) {
+    Debug.println("Reonnecting MQTT...");
+    // Attempt to connect
+    if (client.connect("ESP8266Client")) {
+      Debug.println("MQTT connected");
+      // Once connected, publish an announcement...
+      client.publish("battery/charger/status", "online");
+      // ... and resubscribe
+      client.subscribe("battery/settings/#");
+      client.subscribe("inverter/Pac1");
+    } else {
+      Debug.println("failed, rc=" + String(client.state()) + ".");
+    }
+  }
+}
 
 void init_mqtt() {
   client.setServer(mqtt_server, 1883);
   client.setCallback(mqtt_rx);
   // Loop until we're reconnected
-  if (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (client.connect("ESP8266Client")) {
-      Serial.println("connected");
-      // Once connected, publish an announcement...
-      client.publish("battery/charger/status", "online");
-      // ... and resubscribe
-      client.subscribe("battery/charger/settings/#");
-      client.subscribe("inverter/Pac1");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
-  }
+  ts.add(2, 5000, reconnect_mqtt, true);
 }
 
 void init_ntp(){
   NTP.onNTPSyncEvent([](NTPSyncEvent_t error) {
     if (error) {
-      Serial.print("Time Sync error: ");
+      Debug.print("Time Sync error: ");
       if (error == noResponse)
-        Serial.println("NTP server not reachable");
+        Debug.println("NTP server not reachable");
       else if (error == invalidAddress)
-        Serial.println("Invalid NTP server address");
+        Debug.println("Invalid NTP server address");
     }else {
-      Serial.print("Got NTP time: ");
-      Serial.println(NTP.getTimeDateString(NTP.getLastNTPSync()));
+      Debug.println("Got NTP time: " + NTP.getTimeDateString(NTP.getLastNTPSync()));
       _ntp_ready = true;
     }
 
@@ -284,9 +295,14 @@ void init_wifi(){
     else if (error == OTA_END_ERROR) Serial.println("End Failed");
   });
   ArduinoOTA.begin();
+
+  Debug.begin("frankencharger");
+  Debug.setResetCmdEnabled(true);
 }
 
 void read_analogs(){
+
+  //client.publish("battery/status", "reading analogs");
   float v = voltage();
 
   // overvoltage protection
@@ -311,18 +327,19 @@ void init_analogs(){
 }
 
 void read_daytime(){
-  time_t tnow = now();
-  if(tnow < _sunrise + _sun_buffer){
+  time_t hnow = hour(now());
+  Debug.println("Evaluating daytime ("+String(hnow)+")");
+  if(hnow < _sunrise + _sun_buffer){
     charger(MODE_IDLE);
-  }else if (tnow > _hr_sleep && _mode != MODE_IDLE){
+  }else if (hnow >= _hr_sleep && _mode != MODE_IDLE){
     charger(MODE_IDLE);
-  }else if (tnow > _sunset - _sun_buffer && _mode != MODE_EXPORTING){
+  }else if (hnow > _sunset && hnow < _hr_sleep && _mode != MODE_EXPORTING){
     charger(MODE_EXPORTING);
   }
 }
 
 void init_daytime(){
-  ts.add(1, 60*1000, read_daytime, true);
+  ts.add(1, 10000, read_daytime, true);
 }
 
 void setup() {
@@ -338,11 +355,15 @@ void setup() {
   pinMode(K_BAT, OUTPUT);
 
   init_mqtt();
+  init_ntp();
   charger(MODE_IDLE);
   init_analogs();
-  Serial.println("Booted.");
+  init_daytime();
 
+
+  Debug.println("Booted");
 }
+unsigned long nexthb = 0;
 
 void loop() {
   // task scheduler
@@ -353,4 +374,12 @@ void loop() {
   client.loop();
   // ESP functions
   yield();
+  // Debug
+  Debug.handle();
+
+  if(millis() > nexthb){
+    Debug.println("Heartbeat @ " + NTP.getTimeStr());
+    //client.publish("battery/heartbeat", "ping");
+    nexthb = millis() + 5000;
+  }
 }
