@@ -36,6 +36,8 @@ const char * MQTT_TOPIC_RELAY_BAT   = "battery/state/inverter";
 const char * NTP_SERVER             = "192.168.0.3";
 
 
+#define SECONDS_SINCE_SOLAR_DEBOUNCE 300
+
 #define MODE_IDLE 0
 #define MODE_CHARGING 1
 #define MODE_EXPORTING 2
@@ -47,6 +49,9 @@ const char * NTP_SERVER             = "192.168.0.3";
 #define BAT_DISCONNECTED 0
 #define BAT_CONNECTED 1
 
+
+time_t _last_solar_time = 0;
+float  _last_solar_watts = 0;
 
 
 // Status variables
@@ -184,6 +189,7 @@ void mqtt_rx(char* topic, byte* payload, unsigned int length) {
   String tmp;
   tmp = String(topic);
   String pl =  munge_payload(payload, length);
+  yield();
   Debug.println("Got message " + tmp + " = " + pl);
   // Listen for solar inverter output data
   if(tmp.startsWith("inverter")){
@@ -191,12 +197,9 @@ void mqtt_rx(char* topic, byte* payload, unsigned int length) {
     if(tmp == "Pac1"){
       // Parse as float
       float Pac1 = pl.toFloat();
-      // If inverter is exporting < threshold, idle
-      if(Pac1 < _solar_min){
-        charger(MODE_IDLE);
-      // If inverter is exporting >= threashold, charge battery
-      }else if(Pac1 >= _solar_min){
-        charger(MODE_CHARGING);
+      _last_solar_watts = Pac1;
+      if(_last_solar_watts > 0){
+        _last_solar_time = now();
       }
     }
   // this is intended for us!
@@ -211,6 +214,7 @@ void mqtt_rx(char* topic, byte* payload, unsigned int length) {
         charger(MODE_IDLE);
       }
     }
+    yield();
     if(tmp == "solar_min") _solar_min = pl.toFloat();
     if(tmp == "hr_sleep") _hr_sleep = pl.toInt();
     if(tmp == "hr_sunrise") _sunrise = pl.toInt();
@@ -219,16 +223,16 @@ void mqtt_rx(char* topic, byte* payload, unsigned int length) {
     if(tmp == "dst") _dst = pl.toInt();
     if(tmp == "max_voltage") _max_voltage = pl.toFloat();
     if(tmp == "min_voltage") _min_voltage = pl.toFloat();
+    yield();
   }
 }
 
 
 void reconnect_mqtt(){
   if (!client.connected()) {
-    Debug.println("Reonnecting MQTT...");
     // Attempt to connect
-    if (client.connect("ESP8266Client")) {
-      Debug.println("MQTT connected");
+    if (client.connect("frankencharger")) {
+      Debug.println("MQTT reconnected");
       // Once connected, publish an announcement...
       client.publish("battery/charger/status", "online");
       // ... and resubscribe
@@ -329,12 +333,26 @@ void init_analogs(){
 void read_daytime(){
   time_t hnow = hour(now());
   Debug.println("Evaluating daytime ("+String(hnow)+")");
+  Debug.println("hr_sleep = " + String(_hr_sleep));
+  Debug.println("sunrise = " + String(_sunrise));
+  Debug.println("sunset = " + String(_sunset));
+  Debug.println("lastsolar = " + String(_last_solar_time));
+
   if(hnow < _sunrise + _sun_buffer){
     charger(MODE_IDLE);
+    Debug.println("Too early - Sleep");
+  }else if(_last_solar_watts >= _solar_min){
+    charger(MODE_CHARGING);
   }else if (hnow >= _hr_sleep && _mode != MODE_IDLE){
     charger(MODE_IDLE);
-  }else if (hnow > _sunset && hnow < _hr_sleep && _mode != MODE_EXPORTING){
+    Debug.println("too late - Sleep");
+  }else if (
+    hnow > _sunset &&
+    hnow < _hr_sleep &&
+    (_last_solar_time == 0 || _last_solar_time < now() - SECONDS_SINCE_SOLAR_DEBOUNCE) &&
+    _mode != MODE_EXPORTING){
     charger(MODE_EXPORTING);
+    Debug.println("Export!");
   }
 }
 
